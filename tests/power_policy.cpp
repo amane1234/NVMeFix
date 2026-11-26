@@ -154,9 +154,8 @@ struct NVMeFixPlugin {
     atomic_uint activePMControllers = 0;
     bool tickleHooked = true;
     atomic_int onAC = -1;
-    bool l1ssRequested = false;
     unsigned linkReapplied = 0;
-    void reapplyLinkPM(ControllerEntry&) { if (l1ssRequested) ++linkReapplied; }
+    void reapplyLinkPM(ControllerEntry& entry) { if (entry.l1ssRequested) ++linkReapplied; }
     struct {
         struct {
             unsigned calls = 0;
@@ -477,13 +476,12 @@ int main() {
         // -nvmefl1ss subscribes even without APST and reapplies the link settings on each wake.
         Drive drive;
         drive.id->apsta = 0;
-        plugin.l1ssRequested = true;
+        drive.entry.l1ssRequested = true;
         drive.start();
         assert(drive.subscribed);
         drive.wake();
         drive.wake();
         assert(plugin.linkReapplied == 2);
-        plugin.l1ssRequested = false;
     }
     {
         // Without the activityTickle hook active PM would lower the power state under I/O.

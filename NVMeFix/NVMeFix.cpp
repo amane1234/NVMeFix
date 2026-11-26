@@ -352,18 +352,21 @@ struct PCIPort {
 }
 
 /**
- * -nvmefl1ss (testing only): enable ASPM L1.2 on the SSD link with Linux' timing. The board must route
+ * nvme-aspm-l12 / -nvmefl1ss: enable ASPM L1.2 on the SSD link with Linux' timing. The board must route
  * CLKREQ#; a link that cannot leave L1.2 makes the SSD stop answering. Every step is read back and the
- * previous configuration restored on a mismatch. The entry lock is held.
+ * previous configuration restored on a mismatch. quiet: nothing is published or logged when nothing
+ * had to change (the check after each wake). The entry lock is held.
  */
-void NVMeFixPlugin::configureL12(IOService* controller) {
+bool NVMeFixPlugin::configureL12(IOService* controller, bool quiet) {
 	IOPCIDevice *ssd, *bridge;
 	if (!linkPartners(controller, ssd, bridge))
-		return;
+		return false;
 	PCIPort parent, child;
 	L1SS::Timing timing;
 	auto result = parent.find(bridge) && child.find(ssd) ?
 		L1SS::enableASPML12(parent, child, timing) : L1SS::Result::Unsupported;
+	if (quiet && result == L1SS::Result::AlreadyEnabled)
+		return false;
 	controller->setProperty("nvmef-l1ss-status", L1SS::describe(result));
 	if (timing.thresholdUs) {
 		controller->setProperty("nvmef-l12-threshold-us", timing.thresholdUs, 32);
@@ -373,14 +376,17 @@ void NVMeFixPlugin::configureL12(IOService* controller) {
 		SYSLOG(Log::Plugin, "ASPM L1.2 enabled, threshold %u us, T_POWER_ON %u us", timing.thresholdUs, timing.powerOnUs);
 	else if (result != L1SS::Result::AlreadyEnabled)
 		SYSLOG(Log::Plugin, "ASPM L1.2 %s", L1SS::describe(result));
+	// Enabled, Restored and LinkLost wrote registers; the other results changed nothing.
+	return result == L1SS::Result::Enabled || result == L1SS::Result::Restored || result == L1SS::Result::LinkLost;
 }
 
 /* A power transition can drop the L1 PM Substates configuration. The entry lock is held. */
 void NVMeFixPlugin::reapplyLinkPM(ControllerEntry& entry) {
-	if (!l1ssRequested)
+	if (!entry.l1ssRequested)
 		return;
-	configureL12(entry.controller);
-	reportLinkPM(entry.controller);
+	// Only a link that had to be programmed again is reported again.
+	if (configureL12(entry.controller, true))
+		reportLinkPM(entry.controller);
 }
 
 /**
@@ -448,10 +454,12 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	 */
 	if (checkKernelArgument("-nvmefaspm"))
 		forceEnableASPM(entry.controller);
-	if (checkKernelArgument("-nvmefl1ss")) {
-		l1ssRequested = true;
-		configureL12(entry.controller);
-	}
+	// ASPM L1.2 is opt-in: an nvme-aspm-l12 property on the SSD's PCI device, or -nvmefl1ss for all SSDs.
+	auto pci = entry.controller->getParentEntry(gIOServicePlane);
+	entry.l1ssRequested = checkKernelArgument("-nvmefl1ss") ||
+		(pci && pci->metaCast("IOPCIDevice") && pci->getProperty("nvme-aspm-l12"));
+	if (entry.l1ssRequested)
+		configureL12(entry.controller, false);
 	reportLinkPM(entry.controller);
 
 	/* Disassembled offsets are only used once they fit the loaded classes */

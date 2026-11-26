@@ -55,9 +55,9 @@ bool NVMeFixPlugin::PM::init(ControllerEntry& entry, const NVMe::nvme_id_ctrl* c
 	entry.pm->PMinit();
 	reinterpret_cast<IOService*>(root)->joinPMtree(entry.pm);
 
-	// A failed Set Features at boot still needs a retry when the controller wakes, and the link
-	// power settings of -nvmefl1ss may not survive a power transition.
-	if ((ctrl->apsta & 1) || plugin.l1ssRequested)
+	// A failed Set Features at boot still needs a retry when the controller wakes, and the ASPM
+	// L1.2 settings may not survive a power transition.
+	if ((ctrl->apsta & 1) || entry.l1ssRequested)
 		entry.controller->registerInterestedDriver(entry.pm);
 
 	return settle(entry, ctrl, state);

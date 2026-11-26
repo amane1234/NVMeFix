@@ -277,6 +277,8 @@ private:
 		/* The last APST configuration was written and read back as requested */
 		bool apstConfirmed {false};
 		unsigned apstRetries {0};
+		/* ASPM L1.2 requested (nvme-aspm-l12 property or -nvmefl1ss), set at setup */
+		bool l1ssRequested {false};
 		/* Last power state set or observed with active PM, 0xFF when unknown */
 		uint8_t lastPS {0xFF};
 		/* An activity tickle found the entry locked; replayed when the lock is released */
@@ -329,9 +331,8 @@ private:
 	void handleControllers();
 	void forceEnableASPM(IOService*);
 	void reportLinkPM(IOService*);
-	/* -nvmefl1ss: enable ASPM L1.2 at setup and again after each controller power transition */
-	bool l1ssRequested {false};
-	void configureL12(IOService*);
+	/* ASPM L1.2 at setup and again after each controller power transition; true when registers changed */
+	bool configureL12(IOService*, bool quiet);
 	void reapplyLinkPM(ControllerEntry&);
 	void handleController(ControllerEntry&);
 	IOReturn identify(ControllerEntry&,IOBufferMemoryDescriptor*&);

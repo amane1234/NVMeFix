@@ -41,8 +41,10 @@ Configuration
 as for daily usage one could inject `pci-aspm-default` device property with `<02 00 00 00>` value into the SSD devices and bridge devices they are connected to onboard.
 Updated values will be visible as `pci-aspm-custom` in the affected devices.
 
-`-nvmefl1ss` enables ASPM L1.2 (L1 PM Substates) on the SSD link, for testing only. Many laptops support
-L1.2 on both the SSD and its root port, but the firmware leaves it off. NVMeFix then enables LTR on both
+ASPM L1.2 (L1 PM Substates) is opt-in. Many laptops support L1.2 on both the SSD and its root port, but
+the firmware leaves it off. For daily use, inject an `nvme-aspm-l12` device property (any value, e.g.
+`<01 00 00 00>`) into the SSD's PCI device (the same device as `ps-max-latency-us`); `-nvmefl1ss` enables
+it for every SSD and is meant for a first test. NVMeFix then enables LTR on both
 ends and programs the L1.2 timing the way Linux does: the larger Common_Mode_Restore_Time and T_POWER_ON
 of both ports, and an LTR_L1.2_THRESHOLD of the time to enter and leave L1.2. ASPM L1 must already be on
 (firmware, `pci-aspm-default`, or `-nvmefaspm`). The setting is applied again after each power transition
@@ -86,7 +88,8 @@ be confirmed, NVMeFix retries after 1, 5 and 30 seconds, and again after the nex
 The SSD and its upstream bridge get `nvmef-aspm-supported` and `nvmef-aspm-enabled` (bit 0 L0s, bit 1 L1)
 and, when they have the L1 PM Substates capability, `nvmef-l1ss-supported` and `nvmef-l1ss-enabled`
 (bit 0 PCI-PM L1.2, bit 1 PCI-PM L1.1, bit 2 ASPM L1.2, bit 3 ASPM L1.1). L1 substates are enabled only
-by firmware or the PCI driver; without `-nvmefl1ss` NVMeFix only reads them.
+by firmware or the PCI driver; without `nvme-aspm-l12` or `-nvmefl1ss` NVMeFix only reads them. After a
+wake NVMeFix only republishes them when it had to program the link again.
 
 If active power management initialisation is successful, an `NVMePMProxy` entry will be created
 in the IOPower IORegistry plane with IOPowerManagement dictionary.
