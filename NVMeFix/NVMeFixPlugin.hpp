@@ -23,6 +23,7 @@
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
+#include <kern/thread_call.h>
 #include <Headers/kern_patcher.hpp>
 #include <Headers/kern_util.hpp>
 
@@ -44,6 +45,13 @@ private:
 	static bool matchingNotificationHandler(void*, void*, IOService*, IONotifier*);
 	static bool terminatedNotificationHandler(void*, void*, IOService*, IONotifier*);
 	bool solveSymbols(KernelPatcher& kp);
+	bool validateLayout(IOService* controller);
+	bool validateRequestLayout();
+
+	/* Private IONVMeFamily layout: checked against the live class sizes once a controller exists */
+	enum Layout : uint8_t { LayoutUnchecked, LayoutValid, LayoutInvalid };
+	uint8_t requestLayout {LayoutUnchecked};
+	uint8_t controllerLayout {LayoutUnchecked};
 
 	atomic_bool solvedSymbols = false;
 
@@ -159,6 +167,9 @@ private:
 		} AppleNVMeRequest;
 	} kextFuncs;
 	
+	/* No IONVMeFamily object member is expected beyond this offset */
+	static constexpr int64_t MaxMemberOffset {0x4000};
+
 	struct {
 		template <typename T>
 		struct Member {
@@ -204,7 +215,17 @@ private:
 
 					/* mov reg, [reg+disp] */
 					if (dis.opcode == opcode && dis.modrm_reg == reg && dis.modrm_rm == (rm & 7) && dis.rex_b == ((rm & 8) >> 3)) {
-						offs = dis.disp.disp32 + add;
+						/* Only a register base plus a positive displacement describes a member offset */
+						int64_t disp = -1;
+						if ((dis.flags & F_MODRM) && dis.modrm_mod == 2 && (dis.flags & F_DISP32))
+							disp = static_cast<int32_t>(dis.disp.disp32);
+						else if ((dis.flags & F_MODRM) && dis.modrm_mod == 1 && (dis.flags & F_DISP8))
+							disp = static_cast<int8_t>(dis.disp.disp8);
+						if (disp <= 0 || disp + add > MaxMemberOffset) {
+							SYSLOG(Log::Disasm, "Unexpected member operand");
+							return false;
+						}
+						offs = static_cast<mach_vm_address_t>(disp + add);
 						DBGLOG(Log::Disasm, "Offset 0x%x for %s", offs, name);
 						return true;
 					}
@@ -236,10 +257,30 @@ private:
 	 */
 	static constexpr int controllerSearchDepth {20};
 
+
 	enum class APSTState { Unknown, Disabled, Enabled };
+
+	/* Minimum APST idle time before a transition (Linux' default primary APST timeout) */
+	static constexpr uint64_t minIdleTimeMs {100};
 
 	struct ControllerEntry {
 		IOService* controller {nullptr};
+		/* Optional ps-max-latency-us-ac / ps-max-latency-us-battery overrides, UINT64_MAX when unset */
+		uint64_t ac_latency_us {UINT64_MAX};
+		uint64_t battery_latency_us {UINT64_MAX};
+		/*
+		 * Incremented whenever the controller may have lost its NVMe power settings: a power
+		 * state change of the controller, or a power state that changed without the host.
+		 * Deferred work started for an older generation is dropped. Protected by the entry lock.
+		 */
+		uint32_t generation {0};
+		/* The last APST configuration was written and read back as requested */
+		bool apstConfirmed {false};
+		unsigned apstRetries {0};
+		/* Last power state set or observed with active PM, 0xFF when unknown */
+		uint8_t lastPS {0xFF};
+		/* An activity tickle found the entry locked; replayed when the lock is released */
+		atomic_bool tickleMissed;
 		bool processed {false}; // Protected by the registry lock.
 		bool retryIdentify {false}; // Retry on the next matching media notification.
 		bool removed {false}; // Protected by the entry lock.
@@ -254,11 +295,8 @@ private:
 		bool activePM {false}; // Protected by the entry lock, as is the last manual power setting.
 		bool restorePS0 {false};
 
-		bool apstAllowed() {
-			return !(quirks & NVMe::nvme_quirks::NVME_QUIRK_NO_APST) && ps_max_latency_us > 0;
-		}
-
 		explicit ControllerEntry(IOService* c) : controller(c), lck(IOLockAlloc()) {
+			atomic_init(&tickleMissed, false);
 			controller->retain();
 		}
 
@@ -275,13 +313,29 @@ private:
 
 	evector<ControllerEntry*> controllers;
 	atomic_uint activePMControllers = 0;
+	/* IONVMeController::activityTickle is routed; active PM needs it to see I/O */
+	bool tickleHooked {false};
+	/* Power source for the AC/battery latency overrides: -1 unknown, 0 battery, 1 AC */
+	atomic_int onAC = -1;
+	atomic_bool powerSourceWatch = false;
+	IONotifier* powerSourceNotifier {nullptr};
+	IONotifier* powerSourceInterest {nullptr};
+	static bool powerSourcePublished(void*, void*, IOService*, IONotifier*);
+	static IOReturn powerSourceChanged(void*, void*, UInt32, IOService*, void*, vm_size_t);
+	void watchPowerSource();
+	void powerSourceUpdated();
 	void setActivePM(ControllerEntry&, bool);
+	void releaseEntry(ControllerEntry&);
 	void handleControllers();
 	void forceEnableASPM(IOService*);
+	void reportLinkPM(IOService*);
 	void handleController(ControllerEntry&);
 	IOReturn identify(ControllerEntry&,IOBufferMemoryDescriptor*&);
+	uint64_t latencyLimit(const ControllerEntry&) const;
+	bool apstAllowed(const ControllerEntry&) const;
 	APSTState applyAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*);
-	IOReturn configureAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*, bool& enabled);
+	IOReturn configureAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*, bool& enabled, IOBufferMemoryDescriptor*);
+	IOReturn verifyAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*, const IOBufferMemoryDescriptor*, bool& enabled, bool& matches);
 	IOReturn APSTenabled(ControllerEntry&, bool&);
 	IOReturn dumpAPST(ControllerEntry&, int npss);
 	IOReturn NVMeFeatures(ControllerEntry&, unsigned fid, unsigned* dword11, IOBufferMemoryDescriptor* desc,
@@ -290,9 +344,23 @@ private:
 	struct PM {
 		bool init(ControllerEntry&, const NVMe::nvme_id_ctrl*, APSTState);
 		bool updatePolicy(ControllerEntry&, const NVMe::nvme_id_ctrl*, APSTState);
+		bool settle(ControllerEntry&, const NVMe::nvme_id_ctrl*, APSTState);
+		bool refresh(ControllerEntry&, const NVMe::nvme_id_ctrl*);
+		void resetDetected(ControllerEntry&);
 		bool solveSymbols(KernelPatcher&);
 
+		/* APST retries after a failed or unconfirmed configuration, per generation: 1 s, 5 s, 30 s */
+		static constexpr unsigned maxRetries {3};
+		static uint32_t retryDelayMs(unsigned attempt) {
+			return attempt == 0 ? 1000 : attempt == 1 ? 5000 : 30000;
+		}
+		/* How long IOKit waits for a setPowerState finished by the worker */
+		static constexpr IOReturn deferredAckUs {2000000};
+
 		static constexpr unsigned idlePeriod {2}; /* seconds */
+		/* activityTickle slot (counting the two vtable header words) of macOS 10.14 to 26 */
+		static constexpr size_t legacyTickleSlot {249};
+		static constexpr size_t maxVtableSlots {1024};
 
 		static bool activityTickle(void*,unsigned long,unsigned long);
 
@@ -321,6 +389,18 @@ public:
 	// A successfully initialized proxy owns the entry until its final IOKit callback returns.
 	NVMeFixPlugin::ControllerEntry* entry {nullptr};
 	void free() override;
+
+	// Deferred work. Each pending call holds a reference to the proxy, and so to the entry.
+	bool initWork();
+	bool scheduleAck(unsigned long ordinal);
+	bool scheduleRetry(uint32_t delayMs, uint32_t generation);
+	void applyPowerState(unsigned long ordinal);
+private:
+	thread_call_t ackCall {nullptr}, retryCall {nullptr};
+	unsigned long pendingOrdinal {0};
+	uint32_t retryGeneration {0};
+	static void ackWork(thread_call_param_t, thread_call_param_t);
+	static void retryWork(thread_call_param_t, thread_call_param_t);
 };
 
 #endif /* NVMeFixPlugin_h */

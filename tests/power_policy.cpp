@@ -22,6 +22,57 @@ struct IOPMPowerState {
 };
 struct IONotifier {};
 struct KernelPatcher {};
+
+// Thread calls run only when the test drains them, so each deferral can be checked.
+using thread_call_param_t = void*;
+struct thread_call {
+    void (*fn)(void*, void*);
+    void* param;
+    bool pending = false;
+    uint64_t deadline = 0;
+};
+using thread_call_t = thread_call*;
+std::vector<thread_call*> threadCalls;
+constexpr uint32_t kMillisecondScale = 1000000;
+thread_call_t thread_call_allocate(void (*fn)(void*, void*), void* param) {
+    threadCalls.push_back(new thread_call{fn, param});
+    return threadCalls.back();
+}
+bool thread_call_enter(thread_call_t call) {
+    bool was = call->pending;
+    call->pending = true;
+    call->deadline = 0;
+    return was;
+}
+bool thread_call_enter_delayed(thread_call_t call, uint64_t deadline) {
+    bool was = call->pending;
+    call->pending = true;
+    call->deadline = deadline;
+    return was;
+}
+bool thread_call_free(thread_call_t call) {
+    assert(!call->pending);
+    for (size_t i = 0; i < threadCalls.size(); ++i)
+        if (threadCalls[i] == call) threadCalls.erase(threadCalls.begin() + i);
+    delete call;
+    return true;
+}
+void clock_interval_to_deadline(uint32_t interval, uint32_t scale, uint64_t* deadline) {
+    *deadline = uint64_t(interval) * scale;
+}
+// Run the calls pending now once; calls they schedule again wait for the next round.
+bool runPending() {
+    std::vector<thread_call*> due;
+    for (auto call : threadCalls)
+        if (call->pending) due.push_back(call);
+    for (auto call : due) {
+        call->pending = false;
+        call->fn(call->param, nullptr); // May free calls later in the list: each is run before its free.
+    }
+    return !due.empty();
+}
+void drainPending() { while (runPending()) {} }
+bool rootAvailable = true;
 namespace NVMe {
 enum nvme_quirks { NVME_QUIRK_NONE = 0, NVME_QUIRK_NO_APST = 16, NVME_QUIRK_NO_DEEPEST_PS = 32 };
 }
@@ -50,20 +101,28 @@ struct IOService {
     unsigned references = 1, registrations = 0, tickles = 0, timer = 0;
     int published = -1, driverRequest = 0, deviceRequest = 0;
     bool subscribed = false, enabled = false, rejectSet = false, rejectGet = false;
-    bool rejectPS = false, rejectTimer = false;
-    unsigned sets = 0, gets = 0, manualPS = 0, manualSets = 0;
+    bool rejectPS = false, rejectTimer = false, corruptReadback = false, requested = false;
+    unsigned sets = 0, gets = 0, manualPS = 0, manualSets = 0, failSets = 0, acks = 0, resetGeneration = 0;
     alignas(uint64_t) NVMe::nvme_feat_auto_pst table{};
     virtual ~IOService() = default;
     virtual void free() { delete this; }
     void release() { if (--references == 0) free(); }
     void retain() { ++references; }
-    void setProperty(const char*, bool value) { published = value; }
-    void removeProperty(const char*) { published = -1; }
+    void setProperty(const char* key, bool value) {
+        if (!strcmp(key, "apst")) published = value;
+        else { assert(!strcmp(key, "apst-requested")); requested = value; }
+    }
+    void setProperty(const char* key, unsigned value, unsigned) {
+        assert(!strcmp(key, "reset-generation"));
+        resetGeneration = value;
+    }
+    void removeProperty(const char* key) { assert(!strcmp(key, "apst")); published = -1; }
+    void acknowledgeSetPowerState() { ++acks; }
     bool init() { return true; }
     void PMinit() {}
     void PMstop() {}
     void joinPMtree(IOService*) {}
-    static IOService* getPMRootDomain() { static IOService root; return &root; }
+    static IOService* getPMRootDomain() { static IOService root; return rootAvailable ? &root : nullptr; }
     void registerInterestedDriver(IOService*) { subscribed = true; }
     void deRegisterInterestedDriver(IOService*) { subscribed = false; }
     bool metaCast(const char*) { return true; }
@@ -93,6 +152,8 @@ struct NVMeFixPlugin {
     } controllers;
     IOLock registryLock, *lck = &registryLock;
     atomic_uint activePMControllers = 0;
+    bool tickleHooked = true;
+    atomic_int onAC = -1;
     struct {
         struct {
             unsigned calls = 0;
@@ -105,8 +166,12 @@ struct NVMeFixPlugin {
     } kextFuncs;
     static NVMeFixPlugin& globalPlugin() { static NVMeFixPlugin plugin; return plugin; }
     void setActivePM(ControllerEntry&, bool);
+    void releaseEntry(ControllerEntry&);
+    uint64_t latencyLimit(const ControllerEntry&) const;
+    bool apstAllowed(const ControllerEntry&) const;
     APSTState applyAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*);
-    IOReturn configureAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*, bool&);
+    IOReturn configureAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*, bool&, IOBufferMemoryDescriptor*);
+    IOReturn verifyAPST(ControllerEntry&, const NVMe::nvme_id_ctrl*, const IOBufferMemoryDescriptor*, bool&, bool&);
     IOReturn APSTenabled(ControllerEntry&, bool&);
     IOReturn dumpAPST(ControllerEntry&, int);
     ControllerEntry* entryForController(IOService*) const;
@@ -128,6 +193,7 @@ struct NVMeFixPlugin {
         assert(fid == NVMe::NVME_FEAT_AUTO_PST && buffer->getLength() == sizeof(drive.table));
         if (set) {
             ++drive.sets;
+            if (drive.failSets) { --drive.failSets; return kIOReturnNoResources; }
             if (drive.rejectSet) return kIOReturnNoResources;
             drive.enabled = *word != 0;
             memcpy(&drive.table, buffer->getBytesNoCopy(), sizeof(drive.table));
@@ -136,6 +202,8 @@ struct NVMeFixPlugin {
             if (drive.rejectGet) return kIOReturnNoResources;
             if (result) *result = drive.enabled | 0x10; // Only APSTE indicates enabled.
             memcpy(buffer->getBytesNoCopy(), &drive.table, sizeof(drive.table));
+            if (drive.corruptReadback) // The controller reports a different table than it accepted.
+                static_cast<NVMe::nvme_feat_auto_pst*>(buffer->getBytesNoCopy())->entries[0] ^= 1U << 8;
         }
         return 0;
     }
@@ -146,6 +214,15 @@ struct NVMePMProxy : IOService {
     IOReturn powerStateDidChangeTo(IOPMPowerFlags, unsigned long, IOService*);
     IOReturn setPowerState(unsigned long, IOService*);
     void free() override;
+    bool initWork();
+    bool scheduleAck(unsigned long);
+    bool scheduleRetry(uint32_t, uint32_t);
+    void applyPowerState(unsigned long);
+    thread_call_t ackCall = nullptr, retryCall = nullptr;
+    unsigned long pendingOrdinal = 0;
+    uint32_t retryGeneration = 0;
+    static void ackWork(thread_call_param_t, thread_call_param_t);
+    static void retryWork(thread_call_param_t, thread_call_param_t);
 };
 #include "methods.inc"
 
@@ -170,8 +247,11 @@ struct Drive : IOService {
     }
     ~Drive() {
         plugin.terminatedNotificationHandler(&plugin, nullptr, this, nullptr);
+        drainPending(); // Work still queued for the removed drive releases the proxy.
         assert(references == 1 && !subscribed);
     }
+    bool retryPending() { return proxy()->retryCall->pending; }
+    uint64_t retryDelay() { return proxy()->retryCall->deadline / kMillisecondScale; }
     void start() { assert(plugin.PM.init(entry, id, plugin.applyAPST(entry, id))); }
     NVMePMProxy* proxy() { return static_cast<NVMePMProxy*>(entry.pm); }
     void wake() { assert(subscribed); proxy()->powerStateDidChangeTo(kIOPMDeviceUsable, 2, this); }
@@ -296,7 +376,108 @@ int main() {
         plugin.terminatedNotificationHandler(&plugin, nullptr, &drive, nullptr);
         atomic_store(&stop, true);
         io.join();
-        assert(plugin.activePMControllers == 0 && drive.references == 1);
+        assert(plugin.activePMControllers == 0);
+        drainPending(); // A queued policy retry holds the proxy until it sees the removal.
+        assert(drive.references == 1);
     }
-    assert(plugin.activePMControllers == 0 && plugin.controllers.empty());
+    {
+        // A transient Set failure is retried at once; a readback that differs schedules a retry.
+        Drive drive;
+        drive.failSets = 1;
+        drive.start();
+        assert(drive.sets == 2 && drive.enabled && drive.requested && drive.entry.apstConfirmed && !drive.retryPending());
+        drive.corruptReadback = true;
+        drive.wake();
+        assert(drive.published == 1 && !drive.entry.apstConfirmed && drive.retryPending() && drive.retryDelay() == 1000);
+        drive.corruptReadback = false;
+        runPending();
+        assert(drive.entry.apstConfirmed && !drive.retryPending() && drive.entry.apstRetries == 0);
+
+        // Retries back off and stop after three attempts for one generation.
+        drive.rejectSet = true;
+        drive.wake();
+        for (uint64_t delay : {1000u, 5000u, 30000u}) {
+            assert(drive.retryPending() && drive.retryDelay() == delay);
+            runPending();
+        }
+        assert(!drive.retryPending() && !drive.entry.apstConfirmed);
+        drive.rejectSet = false;
+        auto sets = drive.sets;
+        drive.wake(); // A new generation retries again.
+        assert(drive.entry.apstConfirmed && drive.sets == sets + 1 && drive.enabled);
+
+        // Work scheduled for an older generation is dropped.
+        drive.proxy()->scheduleRetry(0, drive.entry.generation - 1);
+        sets = drive.sets;
+        runPending();
+        assert(drive.sets == sets);
+    }
+    {
+        // A non-operational state without latencies still waits the 100 ms minimum.
+        Drive drive;
+        drive.id->psd[3].exit_lat = drive.id->psd[3].entry_lat = 0;
+        drive.start();
+        assert(drive.table.entries[0] == (100U << 8 | 3U << 3));
+        assert(drive.table.entries[3] == (800U << 8 | 4U << 3));
+    }
+    {
+        Drive drive;
+        drive.id->apsta = 0;
+        drive.start();
+        assert(drive.entry.activePM);
+        // A contended setPowerState is finished and acknowledged by the worker.
+        IOLockLock(drive.entry.lck);
+        assert(drive.proxy()->setPowerState(1, drive.proxy()) == NVMeFixPlugin::PM::deferredAckUs);
+        // A tickle that found the entry locked is replayed on release.
+        std::thread io([&drive] { drive.tickle(); });
+        io.join();
+        assert(drive.proxy()->tickles == 0 && atomic_load(&drive.entry.tickleMissed));
+        plugin.releaseEntry(drive.entry);
+        assert(drive.proxy()->tickles == 1 && !atomic_load(&drive.entry.tickleMissed));
+        assert(drive.manualPS == 0 && !drive.proxy()->acks);
+        runPending();
+        assert(drive.manualPS == 2 && drive.proxy()->acks == 1 && drive.entry.lastPS == 2);
+
+        // The power state fell back to PS0 behind the host: a controller reset.
+        drive.manualPS = 0;
+        auto generation = drive.entry.generation;
+        assert(drive.proxy()->setPowerState(2, drive.proxy()) == kIOPMAckImplied);
+        assert(drive.entry.generation == generation + 1 && drive.resetGeneration == generation + 1);
+        assert(drive.manualPS == 1 && drive.retryPending() && drive.retryDelay() == 0);
+        runPending();
+        assert(drive.entry.activePM && drive.entry.apstConfirmed);
+    }
+    {
+        // The latency limit follows the power source when an override exists.
+        Drive drive;
+        drive.entry.ac_latency_us = 10000;
+        drive.entry.battery_latency_us = 2499;
+        atomic_store(&plugin.onAC, 0);
+        drive.start();
+        assert(!drive.enabled && drive.entry.activePM);
+        atomic_store(&plugin.onAC, 1);
+        drive.wake();
+        assert(drive.enabled && !drive.entry.activePM && drive.table.entries[4] == 0);
+        atomic_store(&plugin.onAC, -1);
+        drive.wake();
+        assert(drive.enabled && drive.table.entries[4] == (10050U << 8 | 5U << 3));
+    }
+    {
+        // Without the root domain no proxy is created.
+        Drive drive;
+        rootAvailable = false;
+        assert(!plugin.PM.init(drive.entry, drive.id, plugin.applyAPST(drive.entry, drive.id)));
+        assert(!drive.entry.pm && !drive.subscribed);
+        rootAvailable = true;
+    }
+    {
+        // Without the activityTickle hook active PM would lower the power state under I/O.
+        Drive drive;
+        drive.id->apsta = 0;
+        plugin.tickleHooked = false;
+        drive.start();
+        assert(!drive.entry.activePM && !drive.proxy()->registrations);
+        plugin.tickleHooked = true;
+    }
+    assert(plugin.activePMControllers == 0 && plugin.controllers.empty() && threadCalls.empty());
 }

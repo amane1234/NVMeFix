@@ -21,51 +21,89 @@
 #include "Log.hpp"
 #include "NVMeFixPlugin.hpp"
 
+/* The latency limit for the current power source (ps-max-latency-us-ac/-battery), else ps-max-latency-us */
+uint64_t NVMeFixPlugin::latencyLimit(const ControllerEntry& entry) const {
+	auto ac = atomic_load_explicit(&onAC, memory_order_acquire);
+	if (ac == 1 && entry.ac_latency_us != UINT64_MAX)
+		return entry.ac_latency_us;
+	if (ac == 0 && entry.battery_latency_us != UINT64_MAX)
+		return entry.battery_latency_us;
+	return entry.ps_max_latency_us;
+}
+
+bool NVMeFixPlugin::apstAllowed(const ControllerEntry& entry) const {
+	return !(entry.quirks & NVMe::nvme_quirks::NVME_QUIRK_NO_APST) && latencyLimit(entry) > 0;
+}
+
+/**
+ * Returns the APST state the controller reports after the configuration, which is what the power policy
+ * must follow. entry.apstConfirmed tells whether that state and the table are the ones requested.
+ */
 NVMeFixPlugin::APSTState NVMeFixPlugin::applyAPST(ControllerEntry& entry, const NVMe::nvme_id_ctrl* ctrl) {
-	bool enabled = false;
-	if (ctrl->apsta & 1) {
-		auto status = configureAPST(entry, ctrl, enabled);
-		if (status != kIOReturnSuccess) {
-			SYSLOG(Log::APST, "Failed to configure APST with 0x%x", status);
-			if (APSTenabled(entry, enabled) != kIOReturnSuccess) {
-				entry.controller->removeProperty("apst");
-				return APSTState::Unknown;
-			}
-		}
-#ifdef DEBUG
-		else
-			APSTenabled(entry, enabled);
-		if (enabled && dumpAPST(entry, ctrl->npss))
-			DBGLOG(Log::APST, "Failed to dump APST table");
-#endif
+	entry.apstConfirmed = true;
+	if (!(ctrl->apsta & 1)) {
+		entry.controller->setProperty("apst", false);
+		return APSTState::Disabled;
 	}
+
+	auto table = IOBufferMemoryDescriptor::withCapacity(sizeof(NVMe::nvme_feat_auto_pst), kIODirectionOut);
+	if (!table) {
+		SYSLOG(Log::APST, "Failed to create APST table descriptor");
+		entry.apstConfirmed = false;
+		entry.controller->removeProperty("apst");
+		return APSTState::Unknown;
+	}
+
+	bool requested = false, enabled = false, matches = false;
+	auto status = configureAPST(entry, ctrl, requested, table);
+	// A Set Features right after a wake or reset can fail transiently: try once more at once.
+	if (status != kIOReturnSuccess) {
+		SYSLOG(Log::APST, "Failed to configure APST with 0x%x, retrying", status);
+		status = configureAPST(entry, ctrl, requested, table);
+	}
+	entry.controller->setProperty("apst-requested", requested);
+
+	IOReturn readback;
+	if (status == kIOReturnSuccess) {
+		// Read the feature back in every build: a controller can accept the command and keep another policy.
+		readback = verifyAPST(entry, ctrl, table, enabled, matches);
+	} else {
+		SYSLOG(Log::APST, "Failed to configure APST with 0x%x", status);
+		readback = APSTenabled(entry, enabled);
+	}
+	table->release();
+
+	if (readback != kIOReturnSuccess) {
+		entry.apstConfirmed = false;
+		entry.controller->removeProperty("apst");
+		return APSTState::Unknown;
+	}
+	entry.apstConfirmed = status == kIOReturnSuccess && matches;
+	if (status == kIOReturnSuccess && !matches)
+		SYSLOG(Log::APST, "APST readback differs from the requested configuration");
+#ifdef DEBUG
+	if (enabled && dumpAPST(entry, ctrl->npss))
+		DBGLOG(Log::APST, "Failed to dump APST table");
+#endif
 	entry.controller->setProperty("apst", enabled);
 	return enabled ? APSTState::Enabled : APSTState::Disabled;
 }
 
 /* linux/drivers/nvme/host/core.c:nvme_configure_apst */
 IOReturn NVMeFixPlugin::configureAPST(ControllerEntry& entry, const NVMe::nvme_id_ctrl* ctrl,
-									 bool& enabled) {
+									 bool& enabled, IOBufferMemoryDescriptor* apstDesc) {
 	assert(ctrl);
 	assert(entry.controller);
-
-	auto apstDesc = IOBufferMemoryDescriptor::withCapacity(sizeof(NVMe::nvme_feat_auto_pst),
-														   kIODirectionOut);
-
-	if (!apstDesc) {
-		SYSLOG(Log::APST, "Failed to create APST table descriptor");
-		return kIOReturnNoResources;
-	}
+	assert(apstDesc);
 
 	auto apstTable = reinterpret_cast<NVMe::nvme_feat_auto_pst*>(apstDesc->getBytesNoCopy());
-	if (!apstTable) {
-		apstDesc->release();
+	if (!apstTable)
 		return kIOReturnNoResources;
-	}
 
 	memset(apstTable, 0, sizeof(*apstTable));
 	int max_ps {-1};
-	if (entry.apstAllowed()) {
+	const uint64_t latencyLimitUs = latencyLimit(entry);
+	if (apstAllowed(entry)) {
 		uint64_t target {0};
 		uint64_t max_lat_us {0};
 
@@ -96,7 +134,7 @@ IOReturn NVMeFixPlugin::configureAPST(ControllerEntry& entry, const NVMe::nvme_i
 				continue;
 
 			uint64_t exit_latency_us = ctrl->psd[state].exit_lat;
-			if (exit_latency_us > entry.ps_max_latency_us)
+			if (exit_latency_us > latencyLimitUs)
 				continue;
 
 			uint64_t total_latency_us = exit_latency_us + ctrl->psd[state].entry_lat;
@@ -106,6 +144,16 @@ IOReturn NVMeFixPlugin::configureAPST(ControllerEntry& entry, const NVMe::nvme_i
 			 */
 			uint64_t transition_ms = total_latency_us + 19;
 			transition_ms /= 20;
+			/*
+			 * Firmware that reports no entry or exit latency would get an idle time of 0, which the
+			 * spec leaves without a useful transition. Use Linux' primary APST timeout (100 ms) as
+			 * the minimum idle time instead, so such states neither thrash nor go unused.
+			 */
+			if (transition_ms < minIdleTimeMs) {
+				if (!total_latency_us)
+					DBGLOG(Log::APST, "State %d reports no transition latency", state);
+				transition_ms = minIdleTimeMs;
+			}
 			if (transition_ms > (1ull << 24) - 1)
 				transition_ms = (1ull << 24) - 1;
 
@@ -129,8 +177,40 @@ IOReturn NVMeFixPlugin::configureAPST(ControllerEntry& entry, const NVMe::nvme_i
 	// the latency limit is positive but excludes every non-operational state.
 	enabled = max_ps != -1;
 	uint32_t dword11 = enabled ? 1 : 0;
-	auto ret = NVMeFeatures(entry, NVMe::NVME_FEAT_AUTO_PST, &dword11, apstDesc, nullptr, true);
-	apstDesc->release();
+	return NVMeFeatures(entry, NVMe::NVME_FEAT_AUTO_PST, &dword11, apstDesc, nullptr, true);
+}
+
+/* Read APST back and compare the enable bit and the table entries for the reported states */
+IOReturn NVMeFixPlugin::verifyAPST(ControllerEntry& entry, const NVMe::nvme_id_ctrl* ctrl,
+								   const IOBufferMemoryDescriptor* written, bool& enabled, bool& matches) {
+	matches = false;
+	auto readDesc = IOBufferMemoryDescriptor::withCapacity(sizeof(NVMe::nvme_feat_auto_pst), kIODirectionIn);
+	if (!readDesc)
+		return kIOReturnNoResources;
+	auto read = static_cast<NVMe::nvme_feat_auto_pst*>(readDesc->getBytesNoCopy());
+	auto expected = static_cast<const NVMe::nvme_feat_auto_pst*>(
+		const_cast<IOBufferMemoryDescriptor*>(written)->getBytesNoCopy());
+	if (!read || !expected) {
+		readDesc->release();
+		return kIOReturnNoResources;
+	}
+	memset(read, 0, sizeof(*read));
+
+	uint32_t res {};
+	auto ret = NVMeFeatures(entry, NVMe::NVME_FEAT_AUTO_PST, nullptr, readDesc, &res, false);
+	if (ret == kIOReturnSuccess) {
+		enabled = (res & 1) != 0;
+		bool wantEnabled = false;
+		for (int state = 0; state <= ctrl->npss; state++)
+			wantEnabled |= expected->entries[state] != 0;
+		matches = enabled == wantEnabled;
+		// Entries beyond NPSS are reserved: only compare the states the controller reports.
+		for (int state = 0; matches && state <= ctrl->npss; state++)
+			matches = read->entries[state] == expected->entries[state];
+	} else {
+		DBGLOG(Log::APST, "Failed to read back APST");
+	}
+	readDesc->release();
 	return ret;
 }
 

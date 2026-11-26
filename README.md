@@ -51,6 +51,11 @@ latency is 100000 microseconds, and may be overriden via little-endian 8-byte pr
 `IOService:/AppleACPIPlatformExpert/PCI0@0/AppleACPIPCI/RP06@1C,5/IOPP/SSD0@0`). If set to 0, APST
 will be disabled completely.
 
+`ps-max-latency-us-ac` and `ps-max-latency-us-battery` properties (same format, on the same PCI device)
+replace `ps-max-latency-us` while the Mac runs on AC power or on battery, for example a lower limit on
+AC for responsiveness and a higher one on battery for deeper idle states. APST is reconfigured when the
+power source changes. Without them NVMeFix does not watch the power source.
+
 Diagnostics
 -----------
 
@@ -59,7 +64,15 @@ Diagnostics
 `DEBUG` build will additionally log used power states, detailed error messages, and attempt to
 fetch APST status and table from the controller.
 
-APST enable status is posted to the IONVMeController IORegistry entry `apst` key.
+APST enable status, as read back from the controller, is posted to the IONVMeController IORegistry entry
+`apst` key, and the requested status to `apst-requested`. If they differ, or the configuration could not
+be confirmed, NVMeFix retries after 1, 5 and 30 seconds, and again after the next power transition.
+`reset-generation` counts the times the controller lost its power settings without a power transition.
+
+The SSD and its upstream bridge get `nvmef-aspm-supported` and `nvmef-aspm-enabled` (bit 0 L0s, bit 1 L1)
+and, when they have the L1 PM Substates capability, `nvmef-l1ss-supported` and `nvmef-l1ss-enabled`
+(bit 0 PCI-PM L1.2, bit 1 PCI-PM L1.1, bit 2 ASPM L1.2, bit 3 ASPM L1.1). L1 substates are enabled only
+by firmware or the PCI driver; NVMeFix reads them, it never changes them.
 
 If active power management initialisation is successful, an `NVMePMProxy` entry will be created
 in the IOPower IORegistry plane with IOPowerManagement dictionary.

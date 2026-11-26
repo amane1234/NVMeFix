@@ -10,11 +10,12 @@ end = source.index("\n}", start) + 2
 mock = r"""
 #include <cassert>
 #include <cstdint>
+#include <string>
 #define DBGLOG(...) ((void)0)
 #define SYSLOG(...) ((void)0)
 using IOReturn = int;
-constexpr int kIOReturnSuccess = 0, kIOReturnNoResources = 1;
-enum Stage { Success, Buffer, Acquire, Attach, Prepare, Segments, Submit };
+constexpr int kIOReturnSuccess = 0, kIOReturnNoResources = 1, kIOReturnInternalError = 2;
+enum Stage { Success, Buffer, Acquire, WrongType, Attach, Prepare, Segments, Submit };
 struct IOBufferMemoryDescriptor {
     Stage failure;
     int active = 0;
@@ -22,7 +23,14 @@ struct IOBufferMemoryDescriptor {
     int getLength() { return 256; }
     void complete() { assert(active-- == 1); }
 };
-struct IODMACommand {
+struct OSMetaClassBase {
+    bool wrongType = false;
+    const void* metaCast(const char* name) const {
+        assert(std::string(name) == "AppleNVMeRequest");
+        return wrongType ? nullptr : this;
+    }
+};
+struct IODMACommand : OSMetaClassBase {
     Stage failure;
     int active = 0;
     int setMemoryDescriptor(IOBufferMemoryDescriptor*, bool autoPrepare) {
@@ -76,6 +84,7 @@ int main() {
         plugin.kextFuncs.IONVMeController.GetRequestNew.call = [](void* controller,int,int)->void* {
             auto p = static_cast<NVMeFixPlugin*>(controller);
             if (p->dma.failure == Acquire) return nullptr;
+            p->dma.wrongType = p->dma.failure == WrongType;
             ++p->acquired;
             return &p->dma;
         };

@@ -112,6 +112,15 @@ static constexpr struct pci_device_id nvme_id_table[] = {
 	{ 0x1cc1, 0x8201,   /* ADATA SX8200PNP 512GB */
 		NVME_QUIRK_NO_DEEPEST_PS |
 				NVME_QUIRK_IGNORE_DEV_SUBNQN, },
+	/* Power state quirks from later Linux nvme-pci tables */
+	{ 0x2646, 0x2262,   /* Kingston SKC2000 NVMe SSD */
+		NVME_QUIRK_NO_DEEPEST_PS, },
+	{ 0x1e49, 0x0021,   /* ZHITAI TiPro5000 NVMe SSD */
+		NVME_QUIRK_NO_DEEPEST_PS, },
+	{ 0x1e49, 0x0041,   /* ZHITAI TiPro7000 NVMe SSD */
+		NVME_QUIRK_NO_DEEPEST_PS, },
+	{ 0x025e, 0xf1ac,   /* Solidigm P44 Pro SSDPFKKW020X7 */
+		NVME_QUIRK_NO_DEEPEST_PS, },
 
 	/* Should be taken care of by IONVMeFamily */
 #if 0
@@ -325,6 +334,28 @@ static const struct nvme_core_quirk_entry core_quirks[] = {
 		0x2646,
 		nullptr,
 		"S5Z42105",
+		NVME_QUIRK_NO_DEEPEST_PS,
+	},
+	{
+		/*
+		 * This Kioxia CD6-V Series / HPE PE8030 device times out and
+		 * aborts I/O during any load, but more easily with discards
+		 * (TRIM).
+		 */
+		0x1e0f,
+		"KCD6XVUL6T40",
+		nullptr,
+		NVME_QUIRK_NO_APST,
+	},
+	{
+		/*
+		 * The external Samsung X5 SSD shares the PCI ID of the internal
+		 * 970 EVO Plus, so it is matched by model, and must not enter
+		 * the deepest power state.
+		 */
+		0x144d,
+		"Samsung Portable SSD X5",
+		nullptr,
 		NVME_QUIRK_NO_DEEPEST_PS,
 	},
 };

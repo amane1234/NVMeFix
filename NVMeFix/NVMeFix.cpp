@@ -17,6 +17,8 @@
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/IOPM.h>
 #include <kern/assert.h>
 #include <libkern/c++/OSMetaClass.h>
 
@@ -87,13 +89,89 @@ bool NVMeFixPlugin::solveSymbols(KernelPatcher& kp) {
 	kextMembers.IONVMeController.ANS2MSIWorkaround.fromFunc(kextFuncs.IONVMeController.FilterInterruptRequest.fptr,
 																0x80, 7, 7, 0, 32);
 
-	if (res)
+	/* The controller pointer is the 8-byte field that ends 4 bytes before the result */
+	if (res && kextMembers.AppleNVMeRequest.result.offs >= 12 + sizeof(void*))
 		kextMembers.AppleNVMeRequest.controller.offs = kextMembers.AppleNVMeRequest.result.offs - 12;
+	else
+		res = false;
 
-	res &= PM.solveSymbols(kp);
+	if (res && !validateRequestLayout()) {
+		SYSLOG(Log::Plugin, "Unexpected AppleNVMeRequest layout, NVMeFix disabled");
+		requestLayout = LayoutInvalid;
+		res = false;
+	}
+
+	if (res) {
+		// Without the tickle hook only active PM is unavailable; APST still works.
+		tickleHooked = PM.solveSymbols(kp);
+	}
 	if (!res)
-		DBGLOG(Log::Plugin, "Failed to solve symbols");
+		SYSLOG(Log::Plugin, "Failed to solve symbols");
 	return res;
+}
+
+/* Offsets found by disassembly must describe distinct, aligned members of one object */
+bool NVMeFixPlugin::validateRequestLayout() {
+	auto& m = kextMembers.AppleNVMeRequest;
+	struct Range { mach_vm_address_t offs; size_t size, align; } ranges[] {
+		// The command may sit in a packed part of the request: only pointers must be aligned.
+		{m.result.offs, sizeof(uint32_t), 1},
+		{m.controller.offs, sizeof(void*), alignof(void*)},
+		{m.command.offs, sizeof(NVMe::nvme_command), 1},
+		{m.prpDescriptor.offs, sizeof(void*), alignof(void*)},
+	};
+	for (size_t i = 0; i < arrsize(ranges); i++) {
+		if (!ranges[i].offs || ranges[i].offs % ranges[i].align ||
+			ranges[i].offs + ranges[i].size > static_cast<mach_vm_address_t>(MaxMemberOffset))
+			return false;
+		for (size_t j = 0; j < i; j++)
+			if (ranges[i].offs < ranges[j].offs + ranges[j].size && ranges[j].offs < ranges[i].offs + ranges[i].size)
+				return false;
+	}
+	return true;
+}
+
+/* The class sizes of the loaded kext bound every member offset. Concurrent checks reach the same result. */
+bool NVMeFixPlugin::validateLayout(IOService* controller) {
+	auto sizeOf = [](const char* name) -> size_t {
+		auto sym = OSSymbol::withCStringNoCopy(name);
+		auto meta = sym ? OSMetaClass::getMetaClassWithName(sym) : nullptr;
+		if (sym)
+			sym->release();
+		return meta ? meta->getClassSize() : 0;
+	};
+
+	if (__atomic_load_n(&requestLayout, __ATOMIC_ACQUIRE) == LayoutUnchecked) {
+		auto& m = kextMembers.AppleNVMeRequest;
+		size_t size = sizeOf("AppleNVMeRequest"), base = sizeOf("IODMACommand");
+		// Without the class sizes only the checks made while solving symbols apply.
+		bool known = size && base;
+		bool valid = !known || base < size;
+		const mach_vm_address_t ends[] {
+			m.result.offs + sizeof(uint32_t), m.controller.offs + sizeof(void*),
+			m.command.offs + sizeof(NVMe::nvme_command), m.prpDescriptor.offs + sizeof(void*)
+		};
+		const mach_vm_address_t starts[] {m.result.offs, m.controller.offs, m.command.offs, m.prpDescriptor.offs};
+		// Members of AppleNVMeRequest follow its IODMACommand base and end inside the object.
+		for (size_t i = 0; known && valid && i < arrsize(ends); i++)
+			valid = starts[i] >= base && ends[i] <= size;
+		__atomic_store_n(&requestLayout, static_cast<uint8_t>(valid ? LayoutValid : LayoutInvalid), __ATOMIC_RELEASE);
+		if (!valid)
+			SYSLOG(Log::Plugin, "AppleNVMeRequest members do not fit its class, NVMe commands disabled");
+	}
+	if (__atomic_load_n(&controllerLayout, __ATOMIC_ACQUIRE) == LayoutUnchecked) {
+		// The ANS2 flag is an IONVMeController member: past IOService, inside IONVMeController.
+		size_t size = 0, base = sizeOf("IOService");
+		for (auto meta = controller->getMetaClass(); meta && !size; meta = meta->getSuperClass())
+			if (!strcmp(meta->getClassName(), "IONVMeController"))
+				size = meta->getClassSize();
+		auto& flag = kextMembers.IONVMeController.ANS2MSIWorkaround;
+		bool valid = flag.has() && (!size || !base || (flag.offs >= base && flag.offs < size));
+		__atomic_store_n(&controllerLayout, static_cast<uint8_t>(valid ? LayoutValid : LayoutInvalid), __ATOMIC_RELEASE);
+		if (flag.has() && !valid)
+			SYSLOG(Log::Plugin, "Unexpected ANS2MSIWorkaround offset, workaround disabled");
+	}
+	return __atomic_load_n(&requestLayout, __ATOMIC_ACQUIRE) == LayoutValid;
 }
 
 /**
@@ -175,51 +253,108 @@ void NVMeFixPlugin::handleControllers() {
 			return;
 
 		handleController(*entry);
-		IOLockUnlock(entry->lck);
+		releaseEntry(*entry);
 	}
 }
 
-void NVMeFixPlugin::forceEnableASPM(IOService *controller) {
-	// Use virtual PCI accessors so OpenCore can link without direct IOPCIFamily imports.
+// Use virtual PCI accessors so OpenCore can link without direct IOPCIFamily imports.
+static bool linkPartners(IOService* controller, IOPCIDevice*& ssd, IOPCIDevice*& bridge) {
 	auto pciParent = [](IORegistryEntry *entry, const IORegistryPlane *plane) {
 		auto parent = entry->getParentEntry(plane);
 		return parent ? static_cast<IOPCIDevice *>(parent->metaCast("IOPCIDevice")) : nullptr;
 	};
-	auto ssd = pciParent(controller, gIOServicePlane);
-	auto bridge = ssd ? pciParent(ssd, gIODTPlane) : nullptr;
-	if (!bridge)
+	ssd = pciParent(controller, gIOServicePlane);
+	bridge = ssd ? pciParent(ssd, gIODTPlane) : nullptr;
+	return bridge != nullptr;
+}
+
+static IOPCIAddressSpace configSpace(IOPCIDevice* pci, IOByteCount offset) {
+	auto space = pci->space;
+	space.es.registerNumExtended = (offset >> 8) & 0xF;
+	return space;
+}
+
+void NVMeFixPlugin::forceEnableASPM(IOService *controller) {
+	IOPCIDevice *ssd, *bridge;
+	if (!linkPartners(controller, ssd, bridge))
 		return;
 
 	// Both partners must support L1. Enable the upstream end first.
 	IOPCIDevice *partners[] {bridge, ssd};
 	UInt8 offsets[2] {};
+	UInt16 original[2] {};
 	for (size_t i = 0; i < arrsize(partners); ++i) {
 		auto pci = partners[i];
 		if (!pci->findPCICapability(kIOPCICapabilityIDPCIExpress, &offsets[i]))
 			return;
 		if (offsets[i] > 0xEC)
 			return;
-		auto space = pci->space;
-		space.es.registerNumExtended = 0;
-		auto capabilities = pci->configRead32(space, offsets[i] + 0x0C);
+		auto capabilities = pci->configRead32(configSpace(pci, 0), offsets[i] + 0x0C);
 		if (capabilities == UINT32_MAX || !(capabilities & (1U << 11)))
+			return;
+		original[i] = pci->configRead16(configSpace(pci, 0), offsets[i] + 0x10);
+		if (original[i] == UINT16_MAX)
 			return;
 	}
 
-	for (size_t i = 0; i < arrsize(partners); ++i) {
+	size_t changed = 0;
+	bool ok = true;
+	for (size_t i = 0; ok && i < arrsize(partners); ++i, ++changed) {
 		auto pci = partners[i];
-		auto space = pci->space;
-		space.es.registerNumExtended = 0;
 		UInt8 offset = offsets[i] + 0x10;
-		auto control = pci->configRead16(space, offset);
-		if (control == UINT16_MAX)
-			return;
-		if (!(control & ASPM_L1EntryEnabled))
-			pci->configWrite16(space, offset, control | ASPM_L1EntryEnabled);
-		control = pci->configRead16(space, offset);
-		if (control == UINT16_MAX || !(control & ASPM_L1EntryEnabled))
-			return;
-		pci->setProperty("pci-aspm-custom", control, 32);
+		if (!(original[i] & ASPM_L1EntryEnabled))
+			pci->configWrite16(configSpace(pci, 0), offset, original[i] | ASPM_L1EntryEnabled);
+		auto control = pci->configRead16(configSpace(pci, 0), offset);
+		ok = control != UINT16_MAX && (control & ASPM_L1EntryEnabled);
+	}
+
+	if (!ok) {
+		// L1 on only one end of the link: restore what was there, downstream end first.
+		SYSLOG(Log::Plugin, "Failed to enable ASPM L1 on both link partners, restoring");
+		while (changed-- > 0) {
+			auto pci = partners[changed];
+			pci->configWrite16(configSpace(pci, 0), offsets[changed] + 0x10, original[changed]);
+		}
+		return;
+	}
+	for (size_t i = 0; i < arrsize(partners); ++i) {
+		auto control = partners[i]->configRead16(configSpace(partners[i], 0), offsets[i] + 0x10);
+		partners[i]->setProperty("pci-aspm-custom", control, 32);
+	}
+}
+
+/**
+ * Publish the link power management both link partners support and have enabled, read once at setup:
+ * nvmef-aspm-supported / nvmef-aspm-enabled (bit 0 L0s, bit 1 L1) and, with the L1 PM Substates
+ * capability, nvmef-l1ss-supported / nvmef-l1ss-enabled (bit 0 PCI-PM L1.2, bit 1 PCI-PM L1.1,
+ * bit 2 ASPM L1.2, bit 3 ASPM L1.1).
+ */
+void NVMeFixPlugin::reportLinkPM(IOService* controller) {
+	IOPCIDevice *ssd, *bridge;
+	if (!linkPartners(controller, ssd, bridge))
+		return;
+	IOPCIDevice *partners[] {bridge, ssd};
+	for (auto pci : partners) {
+		UInt8 offset = 0;
+		if (pci->findPCICapability(kIOPCICapabilityIDPCIExpress, &offset) && offset <= 0xEC) {
+			auto capabilities = pci->configRead32(configSpace(pci, 0), offset + 0x0C);
+			auto control = pci->configRead16(configSpace(pci, 0), offset + 0x10);
+			if (capabilities != UINT32_MAX && control != UINT16_MAX) {
+				pci->setProperty("nvmef-aspm-supported", (capabilities >> 10) & 3, 32);
+				pci->setProperty("nvmef-aspm-enabled", control & ASPM_Mask, 32);
+			}
+		}
+		IOByteCount l1ss = 0;
+		if (pci->extendedFindPCICapability(static_cast<UInt32>(kIOPCIExpressCapabilityIDL1PMSubstates), &l1ss) &&
+			l1ss >= 0x100 && l1ss <= 0xFF4) {
+			auto capabilities = pci->configRead32(configSpace(pci, l1ss + 4), (l1ss + 4) & 0xFF);
+			auto control = pci->configRead32(configSpace(pci, l1ss + 8), (l1ss + 8) & 0xFF);
+			if (capabilities != UINT32_MAX && control != UINT32_MAX) {
+				// Bit 4 of the capabilities says the substates are supported at all.
+				pci->setProperty("nvmef-l1ss-supported", (capabilities & (1U << 4)) ? capabilities & 0xF : 0, 32);
+				pci->setProperty("nvmef-l1ss-enabled", control & 0xF, 32);
+			}
+		}
 	}
 }
 
@@ -238,6 +373,10 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	 */
 	if (checkKernelArgument("-nvmefaspm"))
 		forceEnableASPM(entry.controller);
+	reportLinkPM(entry.controller);
+
+	/* Disassembled offsets are only used once they fit the loaded classes */
+	bool layoutValid = validateLayout(entry.controller);
 
 	/**
 	 * Force enable ANS2MSIWorkaround.
@@ -257,7 +396,7 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	 * start of FilterIRQ instead so that FilterIRQ does not race with itself. This seems to eliminate
 	 * the timeouts.
 	 **/
-	if (kextMembers.IONVMeController.ANS2MSIWorkaround.has()) {
+	if (__atomic_load_n(&controllerLayout, __ATOMIC_ACQUIRE) == LayoutValid) {
 		kextMembers.IONVMeController.ANS2MSIWorkaround.get(entry.controller) = 1;
 	} else {
 		DBGLOG(Log::Plugin, "Ignoring ANS2 workaround patch on newer system");
@@ -266,6 +405,13 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	/* First get quirks based on PCI device */
 	entry.quirks = NVMe::quirksForController(entry.controller);
 	propertyFromParent(entry.controller, "ps-max-latency-us", entry.ps_max_latency_us);
+	propertyFromParent(entry.controller, "ps-max-latency-us-ac", entry.ac_latency_us);
+	propertyFromParent(entry.controller, "ps-max-latency-us-battery", entry.battery_latency_us);
+	if (entry.ac_latency_us != UINT64_MAX || entry.battery_latency_us != UINT64_MAX)
+		watchPowerSource();
+
+	if (!layoutValid)
+		return;
 
 	IOBufferMemoryDescriptor* identifyDesc {nullptr};
 
@@ -374,6 +520,9 @@ IOReturn NVMeFixPlugin::NVMeFeatures(ControllerEntry& entry, unsigned fid, unsig
 		if (!req) {
 			DBGLOG(Log::Feature, "IONVMeController::GetRequest failed");
 			ret = kIOReturnNoResources;
+		} else if (!reinterpret_cast<OSMetaClassBase*>(req)->metaCast("AppleNVMeRequest")) {
+			SYSLOG(Log::Feature, "GetRequest returned an unexpected object");
+			ret = kIOReturnInternalError;
 		} else if (desc)
 			ret = reinterpret_cast<IODMACommand*>(req)->setMemoryDescriptor(desc, false);
 
@@ -424,6 +573,62 @@ IOReturn NVMeFixPlugin::NVMeFeatures(ControllerEntry& entry, unsigned fid, unsig
 		desc->complete();
 
 	return ret;
+}
+
+/**
+ * The AC/battery latency overrides follow the first IOPMPowerSource. Installed once, when a controller
+ * has one of the overrides; the notification may call back synchronously, so no lock is held here.
+ */
+void NVMeFixPlugin::watchPowerSource() {
+	bool expected = false;
+	if (!atomic_compare_exchange_strong(&powerSourceWatch, &expected, true))
+		return;
+	powerSourceNotifier = IOService::addMatchingNotification(gIOFirstPublishNotification,
+		IOService::serviceMatching("IOPMPowerSource"), powerSourcePublished, this);
+	if (!powerSourceNotifier)
+		SYSLOG(Log::Plugin, "Failed to watch the power source, AC/battery latencies unused");
+}
+
+bool NVMeFixPlugin::powerSourcePublished(void* that, void*, IOService* service, IONotifier*) {
+	auto plugin = static_cast<NVMeFixPlugin*>(that);
+	IONotifier* none = nullptr;
+	auto notifier = service->registerInterest(gIOGeneralInterest, powerSourceChanged, plugin);
+	if (!notifier)
+		return true;
+	// One power source is enough; a second one keeps no interest.
+	if (!__atomic_compare_exchange_n(&plugin->powerSourceInterest, &none, notifier, false,
+									 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		notifier->remove();
+		return true;
+	}
+	powerSourceChanged(plugin, nullptr, kIOPMMessageBatteryStatusHasChanged, service, nullptr, 0);
+	return true;
+}
+
+IOReturn NVMeFixPlugin::powerSourceChanged(void* target, void*, UInt32 type, IOService* provider, void*, vm_size_t) {
+	if (type != kIOPMMessageBatteryStatusHasChanged)
+		return kIOReturnSuccess;
+	auto plugin = static_cast<NVMeFixPlugin*>(target);
+	auto property = provider->copyProperty(kIOPMPSExternalConnectedKey);
+	auto connected = OSDynamicCast(OSBoolean, property);
+	int ac = connected ? connected->isTrue() : -1;
+	if (property)
+		property->release();
+	if (atomic_exchange_explicit(&plugin->onAC, ac, memory_order_acq_rel) != ac)
+		plugin->powerSourceUpdated();
+	return kIOReturnSuccess;
+}
+
+/* Reconfigure APST with the latency limit of the new power source on each controller's worker */
+void NVMeFixPlugin::powerSourceUpdated() {
+	IOLockLock(lck);
+	for (size_t i = 0; i < controllers.size(); i++) {
+		auto entry = controllers[i];
+		auto pm = static_cast<NVMePMProxy*>(__atomic_load_n(&entry->pm, __ATOMIC_ACQUIRE));
+		if (pm && (entry->ac_latency_us != UINT64_MAX || entry->battery_latency_us != UINT64_MAX))
+			pm->scheduleRetry(0, __atomic_load_n(&entry->generation, __ATOMIC_ACQUIRE));
+	}
+	IOLockUnlock(lck);
 }
 
 bool NVMeFixPlugin::terminatedNotificationHandler(void* that, void* , IOService* service,

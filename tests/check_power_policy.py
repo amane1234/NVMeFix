@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory() as tmp:
     (work / "entry.inc").write_text(section(header, "enum class APSTState", "evector<ControllerEntry*>"))
     (work / "pm.inc").write_text(section(header, "struct PM {", "\n};\n"))
     (work / "methods.inc").write_text(
-        apst[apst.index("NVMeFixPlugin::APSTState NVMeFixPlugin::applyAPST"):]
+        apst[apst.index("uint64_t NVMeFixPlugin::latencyLimit"):]
         + section(pm, "bool NVMeFixPlugin::PM::init(", "OSDefineMetaClassAndStructors")
         + section(pm, "void NVMePMProxy::free()", "bool NVMeFixPlugin::PM::solveSymbols")
         + pm[pm.index("bool NVMeFixPlugin::PM::activityTickle"):]

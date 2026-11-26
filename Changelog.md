@@ -1,5 +1,18 @@
 NVMeFix Changelog
 =================
+#### v1.1.4
+- Validate the private IONVMeFamily layout: disassembled member offsets must use a positive displacement, stay aligned and distinct, and fit the loaded `AppleNVMeRequest` and `IONVMeController` classes; requests must be `AppleNVMeRequest` objects. An unexpected layout disables NVMe commands (or only the ANS2 workaround) instead of writing to the wrong field
+- Locate `activityTickle` in IOService's vtable instead of a fixed slot and only route it when IONVMeController's slot holds the expected function; without the hook only active power management is disabled
+- Finish a `setPowerState` that finds the controller busy on a worker and acknowledge it afterwards, instead of reporting a power state that was never set; replay activity tickles that found the controller busy
+- Read APST back in release builds and follow the reported state; retry a failed Set Features once at once, then after 1, 5 and 30 s
+- Track a reset generation: a controller power transition or a power state changed without the host (controller reset) reapplies the power policy and drops stale deferred work (`reset-generation`)
+- Use a 100 ms minimum APST idle time, so non-operational states that report no entry/exit latency neither thrash nor go unused
+- Skip power management cleanly when the PM root domain is unavailable
+- Restore both link partners when `-nvmefaspm` cannot enable ASPM L1 on both ends
+- Added `ps-max-latency-us-ac` and `ps-max-latency-us-battery` properties to use a different APST latency limit on AC power and on battery
+- Report ASPM and PCIe L1 PM Substates support and state of the SSD and its bridge (`nvmef-aspm-*`, `nvmef-l1ss-*`)
+- Added APST quirks from Linux: Kingston SKC2000, ZHITAI TiPro5000/TiPro7000, Solidigm P44 Pro and Samsung Portable SSD X5 (no deepest power state), Kioxia CD6-V KCD6XVUL6T40 (no APST)
+
 #### v1.1.3
 - Added constants for macOS 26 support
 
