@@ -31,6 +31,7 @@
 
 #include "Log.hpp"
 #include "NVMeFixPlugin.hpp"
+#include "pcie_l1ss.hpp"
 
 static NVMeFixPlugin plugin;
 
@@ -323,6 +324,65 @@ void NVMeFixPlugin::forceEnableASPM(IOService *controller) {
 	}
 }
 
+namespace {
+/* Configuration access for L1SS::enableASPML12 through the virtual accessors */
+struct PCIPort {
+	IOPCIDevice* pci {nullptr};
+	uint16_t pcie {0}, l1ss {0};
+	uint32_t read32(uint16_t off) { return pci->configRead32(configSpace(pci, off), off & 0xFF); }
+	void write32(uint16_t off, uint32_t v) { pci->configWrite32(configSpace(pci, off), off & 0xFF, v); }
+	uint16_t read16(uint16_t off) { return pci->configRead16(configSpace(pci, off), off & 0xFF); }
+	void write16(uint16_t off, uint16_t v) { pci->configWrite16(configSpace(pci, off), off & 0xFF, v); }
+
+	bool find(IOPCIDevice* device) {
+		pci = device;
+		UInt8 offset = 0;
+		IOByteCount extended = 0;
+		// DevCap2/DevCtl2 must be inside the standard configuration header.
+		if (!pci->findPCICapability(kIOPCICapabilityIDPCIExpress, &offset) || offset + L1SS::DevCtl2 + 2 > 0x100)
+			return false;
+		pcie = offset;
+		if (!pci->extendedFindPCICapability(static_cast<UInt32>(kIOPCIExpressCapabilityIDL1PMSubstates), &extended) ||
+			extended < 0x100 || extended + L1SS::Ctl2 + 4 > 0x1000)
+			return false;
+		l1ss = static_cast<uint16_t>(extended);
+		return true;
+	}
+};
+}
+
+/**
+ * -nvmefl1ss (testing only): enable ASPM L1.2 on the SSD link with Linux' timing. The board must route
+ * CLKREQ#; a link that cannot leave L1.2 makes the SSD stop answering. Every step is read back and the
+ * previous configuration restored on a mismatch. The entry lock is held.
+ */
+void NVMeFixPlugin::configureL12(IOService* controller) {
+	IOPCIDevice *ssd, *bridge;
+	if (!linkPartners(controller, ssd, bridge))
+		return;
+	PCIPort parent, child;
+	L1SS::Timing timing;
+	auto result = parent.find(bridge) && child.find(ssd) ?
+		L1SS::enableASPML12(parent, child, timing) : L1SS::Result::Unsupported;
+	controller->setProperty("nvmef-l1ss-status", L1SS::describe(result));
+	if (timing.thresholdUs) {
+		controller->setProperty("nvmef-l12-threshold-us", timing.thresholdUs, 32);
+		controller->setProperty("nvmef-l12-power-on-us", timing.powerOnUs, 32);
+	}
+	if (result == L1SS::Result::Enabled)
+		SYSLOG(Log::Plugin, "ASPM L1.2 enabled, threshold %u us, T_POWER_ON %u us", timing.thresholdUs, timing.powerOnUs);
+	else if (result != L1SS::Result::AlreadyEnabled)
+		SYSLOG(Log::Plugin, "ASPM L1.2 %s", L1SS::describe(result));
+}
+
+/* A power transition can drop the L1 PM Substates configuration. The entry lock is held. */
+void NVMeFixPlugin::reapplyLinkPM(ControllerEntry& entry) {
+	if (!l1ssRequested)
+		return;
+	configureL12(entry.controller);
+	reportLinkPM(entry.controller);
+}
+
 /**
  * Publish the link power management both link partners support and have enabled, read once at setup:
  * nvmef-aspm-supported / nvmef-aspm-enabled (bit 0 L0s, bit 1 L1) and, with the L1 PM Substates
@@ -343,6 +403,21 @@ void NVMeFixPlugin::reportLinkPM(IOService* controller) {
 				pci->setProperty("nvmef-aspm-supported", (capabilities >> 10) & 3, 32);
 				pci->setProperty("nvmef-aspm-enabled", control & ASPM_Mask, 32);
 			}
+			// L1.2 is only entered when LTR is enabled and the device may report a latency.
+			if (offset + L1SS::DevCtl2 + 2 <= 0x100) {
+				auto devCap2 = pci->configRead32(configSpace(pci, 0), offset + L1SS::DevCap2);
+				auto devCtl2 = pci->configRead16(configSpace(pci, 0), offset + L1SS::DevCtl2);
+				if (devCap2 != UINT32_MAX && devCtl2 != UINT16_MAX)
+					pci->setProperty("nvmef-ltr", (devCap2 & L1SS::DevCap2LTR ? 1U : 0U) | (devCtl2 & L1SS::DevCtl2LTR ? 2U : 0U), 32);
+			}
+		}
+		IOByteCount ltr = 0;
+		if (pci->extendedFindPCICapability(static_cast<UInt32>(kIOPCIExpressCapabilityIDLatencyTolerenceReporting), &ltr) &&
+			ltr >= 0x100 && ltr <= 0xFF8) {
+			// Max Snoop (bits 15:0) and Max No-Snoop (bits 31:16) latency the device may report
+			auto maxLatency = pci->configRead32(configSpace(pci, ltr + 4), (ltr + 4) & 0xFF);
+			if (maxLatency != UINT32_MAX)
+				pci->setProperty("nvmef-ltr-max-latency", maxLatency, 32);
 		}
 		IOByteCount l1ss = 0;
 		if (pci->extendedFindPCICapability(static_cast<UInt32>(kIOPCIExpressCapabilityIDL1PMSubstates), &l1ss) &&
@@ -373,6 +448,10 @@ void NVMeFixPlugin::handleController(ControllerEntry& entry) {
 	 */
 	if (checkKernelArgument("-nvmefaspm"))
 		forceEnableASPM(entry.controller);
+	if (checkKernelArgument("-nvmefl1ss")) {
+		l1ssRequested = true;
+		configureL12(entry.controller);
+	}
 	reportLinkPM(entry.controller);
 
 	/* Disassembled offsets are only used once they fit the loaded classes */

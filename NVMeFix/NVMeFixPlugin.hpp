@@ -329,6 +329,10 @@ private:
 	void handleControllers();
 	void forceEnableASPM(IOService*);
 	void reportLinkPM(IOService*);
+	/* -nvmefl1ss: enable ASPM L1.2 at setup and again after each controller power transition */
+	bool l1ssRequested {false};
+	void configureL12(IOService*);
+	void reapplyLinkPM(ControllerEntry&);
 	void handleController(ControllerEntry&);
 	IOReturn identify(ControllerEntry&,IOBufferMemoryDescriptor*&);
 	uint64_t latencyLimit(const ControllerEntry&) const;

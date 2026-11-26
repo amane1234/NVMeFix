@@ -10,7 +10,8 @@ NVMeFix Changelog
 - Skip power management cleanly when the PM root domain is unavailable
 - Restore both link partners when `-nvmefaspm` cannot enable ASPM L1 on both ends
 - Added `ps-max-latency-us-ac` and `ps-max-latency-us-battery` properties to use a different APST latency limit on AC power and on battery
-- Report ASPM and PCIe L1 PM Substates support and state of the SSD and its bridge (`nvmef-aspm-*`, `nvmef-l1ss-*`)
+- Report ASPM and PCIe L1 PM Substates support and state of the SSD and its bridge (`nvmef-aspm-*`, `nvmef-l1ss-*`), and LTR state and maximum latencies (`nvmef-ltr*`)
+- Added `-nvmefl1ss` (testing only) to enable ASPM L1.2 with Linux' L1.2 timing, LTR, read back and rollback, reapplied after power transitions
 - Added APST quirks from Linux: Kingston SKC2000, ZHITAI TiPro5000/TiPro7000, Solidigm P44 Pro and Samsung Portable SSD X5 (no deepest power state), Kioxia CD6-V KCD6XVUL6T40 (no APST)
 
 #### v1.1.3
